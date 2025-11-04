@@ -5,24 +5,22 @@ import io.hhplus.tdd.database.UserPointTable;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * 포인트 비즈니스 로직을 담당하는 서비스 클래스.
  *
- * 요구사항
- * 
- *     특정 유저의 현재 포인트 조회
- *     특정 유저의 포인트 충전 내역 / 사용 내역 조회
- *     포인트 충전
- *     포인트 사용 (잔고 부족 시 실패)
- * 
+ * 기본 기능:
+ *  - 포인트 조회
+ *  - 포인트 충전/사용 내역 조회
+ *  - 포인트 충전
+ *  - 포인트 사용 (잔고 부족 시 실패)
  *
- * 주의사항
- * 
- *     실제 DB 대신 /database 패키지의 UserPointTable, PointHistoryTable 을 사용한다.
- *     /database 패키지의 구현체는 수정하지 않고, 제공된 공개 메서드만 사용해야 한다.
- *     분산 환경(동시성)은 고려하지 않는다는 과제 조건에 따라, 단순 로직으로 구현한다.
- * 
+ * 심화 기능(동시성 제어):
+ *  - 같은 userId 에 대한 charge/use 요청이 동시에 들어오더라도
+ *    "한 번에 하나의 요청만" 처리되도록 사용자별 Lock 을 사용했다.
  */
 @Service
 public class PointService {
@@ -31,132 +29,126 @@ public class PointService {
     private final PointHistoryTable pointHistoryTable;
 
     /**
-     * UserPointTable, PointHistoryTable 을 주입받는 생성자.
-     * 이 두 클래스는 실제 DB 대신 메모리(Map)를 사용하는 "가짜 테이블" 역할을 한다.
+     * userId 별로 잠금을 관리하기 위한 맵.
+     *
+     * - key: userId
+     * - value: 해당 유저의 포인트 변경 시 사용할 ReentrantLock
+     *
+     * ConcurrentHashMap 을 사용하여 멀티 스레드 환경에서도 안전하게 Lock 객체를 조회/생성할 수 있도록 했다.
      */
+    private final ConcurrentHashMap<Long, ReentrantLock> lockMap = new ConcurrentHashMap<>();
+
     public PointService(UserPointTable userPointTable, PointHistoryTable pointHistoryTable) {
         this.userPointTable = userPointTable;
         this.pointHistoryTable = pointHistoryTable;
     }
 
     /**
-     * 특정 유저의 현재 포인트를 조회한다.
+     * 특정 userId 에 대한 Lock 을 가져온다.
+     * 없으면 새로 생성해서 맵에 넣고, 이미 있으면 기존 Lock 을 재사용한다.
      *
-     * 로직
-     * <ol>
-     *     UserPointTable 에서 userId 로 조회한다.
-     *     해당 유저가 없으면 UserPointTable 이 빈 UserPoint(0원)를 반환해 준다.
-     * </ol>
+     * 이 메서드 덕분에 같은 userId 에 대한 요청끼리는 항상 같은 Lock 을 공유하게 된다.
+     */
+    private Lock getLock(long userId) {
+        return lockMap.computeIfAbsent(userId, id -> new ReentrantLock());
+    }
+
+    /**
+     * 특정 유저의 현재 포인트 조회 (읽기만 수행).
      *
-     * @param userId 조회할 유저 ID
-     * @return 유저의 현재 포인트 정보
+     * 동시성 관점에서,
+     * - 조회는 단순한 read 이므로 Lock 없이 호출한다.
+     * - 엄격한 일관성이 필요하다면 charge/use 와 동일하게 Lock 을 걸어도 되지만,
+     *   여기서는 "쓰기 작업의 원자성"에 집중했다.
      */
     public UserPoint getPoint(long userId) {
         return userPointTable.selectById(userId);
     }
 
     /**
-     * 특정 유저의 포인트 히스토리(충전/사용 내역)를 조회한다.
-     *
-     * 로직
-     * <ol>
-     *     PointHistoryTable 에서 userId 에 해당하는 전체 내역 리스트를 조회한다.
-     *     충전/사용 모두 포함하여 최신 순 또는 저장된 순으로 반환한다. (정렬 규칙은 Table 구현체에 따름)
-     * </ol>
-     *
-     * @param userId 조회할 유저 ID
-     * @return 포인트 히스토리 리스트
+     * 특정 유저의 포인트 히스토리(충전/사용 내역) 조회.
+     * 마찬가지로 read-only 작업이므로 Lock 은 사용하지 않았다.
      */
     public List<PointHistory> getHistories(long userId) {
         return pointHistoryTable.selectAllByUserId(userId);
     }
 
     /**
-     * 특정 유저의 포인트를 충전한다.
+     * 포인트 충전.
      *
-     * 로직
-     * <ol>
-     *     충전 금액이 0 이하이면 잘못된 요청으로 보고 IllegalArgumentException 을 던진다.
-     *     UserPointTable 에서 현재 포인트를 조회한다.
-     *     기존 포인트 + 충전 금액으로 새로운 잔액을 계산한다.
-     *     UserPointTable.insertOrUpdate 를 호출하여 잔액을 갱신한다.
-     *     PointHistoryTable.insert 를 호출하여 CHARGE 타입 내역을 기록한다.
-     * </ol>
-     *
-     * @param userId 충전할 유저 ID
-     * @param amount 충전 금액 (0보다 커야 함)
-     * @return 충전 후 갱신된 UserPoint
+     * 동시성 제어 포인트:
+     *  - 같은 userId 에 대해 charge/use 가 동시에 호출되면,
+     *    getLock(userId).lock() 으로 인해 한 번에 한 스레드만 임계 구역에 들어올 수 있다.
+     *  - 임계 구역 내부에서는
+     *      1) 현재 포인트 조회
+     *      2) 새로운 포인트 계산
+     *      3) insertOrUpdate
+     *      4) 히스토리 기록
+     *    이 전체가 하나의 "원자적 연산"처럼 동작한다.
      */
     public UserPoint charge(long userId, long amount) {
-        // 1. 유효성 검증: 0 이하 금액은 잘못된 요청
         if (amount <= 0) {
             throw new IllegalArgumentException("충전 금액은 0보다 커야 합니다.");
         }
 
-        // 2. 현재 잔액 조회
-        UserPoint current = userPointTable.selectById(userId);
-        long newAmount = current.point() + amount; // 기존 포인트 + 충전 금액
+        Lock lock = getLock(userId);
+        lock.lock(); // 임계 구역 진입
+        try {
+            UserPoint current = userPointTable.selectById(userId);
+            long newAmount = current.point() + amount;
 
-        // 3. 포인트 테이블 업데이트
-        UserPoint updated = userPointTable.insertOrUpdate(userId, newAmount);
+            UserPoint updated = userPointTable.insertOrUpdate(userId, newAmount);
 
-        // 4. 히스토리 테이블에 CHARGE 내역 기록
-        pointHistoryTable.insert(
-                userId,
-                amount,
-                TransactionType.CHARGE,
-                System.currentTimeMillis()
-        );
+            pointHistoryTable.insert(
+                    userId,
+                    amount,
+                    TransactionType.CHARGE,
+                    System.currentTimeMillis()
+            );
 
-        return updated;
+            return updated;
+        } finally {
+            lock.unlock(); // 반드시 해제되도록 finally 에서 처리
+        }
     }
 
     /**
-     * 특정 유저의 포인트를 사용한다.
+     * 포인트 사용.
      *
-     * 로직
-     * <ol>
-     *     사용 금액이 0 이하이면 IllegalArgumentException 을 던진다.
-     *     UserPointTable 에서 현재 포인트를 조회한다.
-     *     현재 포인트가 사용 금액보다 적으면 잔고 부족으로 보고 IllegalStateException 을 던진다.
-     *     현재 포인트 - 사용 금액으로 새로운 잔액을 계산한다.
-     *     UserPointTable.insertOrUpdate 를 호출하여 잔액을 갱신한다.
-     *     PointHistoryTable.insert 를 호출하여 USE 타입 내역을 기록한다.
-     * </ol>
-     *
-     * @param userId 포인트를 사용할 유저 ID
-     * @param amount 사용 금액 (0보다 커야 함)
-     * @return 사용 후 갱신된 UserPoint
+     * 동시성 제어 포인트:
+     *  - charge 와 마찬가지로 userId 기준 Lock 을 사용한다.
+     *  - "잔고 부족 검사"와 "포인트 차감"이 같은 Lock 안에서 수행되므로,
+     *    여러 스레드가 동시에 잔고를 검사하더라도 음수 잔액이 발생하지 않는다.
      */
     public UserPoint use(long userId, long amount) {
-        // 1. 유효성 검증
         if (amount <= 0) {
             throw new IllegalArgumentException("사용 금액은 0보다 커야 합니다.");
         }
 
-        // 2. 현재 잔액 조회
-        UserPoint current = userPointTable.selectById(userId);
+        Lock lock = getLock(userId);
+        lock.lock();
+        try {
+            UserPoint current = userPointTable.selectById(userId);
 
-        // 3. 잔고 부족 체크
-        if (current.point() < amount) {
-            // 과제 요구사항: 잔고 부족 시 포인트 사용은 실패해야 한다.
-            throw new IllegalStateException("포인트가 부족합니다.");
+            if (current.point() < amount) {
+                // 과제 요구사항: 잔고 부족 시 실패
+                throw new IllegalStateException("포인트가 부족합니다.");
+            }
+
+            long newAmount = current.point() - amount;
+
+            UserPoint updated = userPointTable.insertOrUpdate(userId, newAmount);
+
+            pointHistoryTable.insert(
+                    userId,
+                    amount,
+                    TransactionType.USE,
+                    System.currentTimeMillis()
+            );
+
+            return updated;
+        } finally {
+            lock.unlock();
         }
-
-        // 4. 포인트 차감
-        long newAmount = current.point() - amount;
-
-        // 5. 포인트 테이블 업데이트
-        UserPoint updated = userPointTable.insertOrUpdate(userId, newAmount);
-
-        // 6. 히스토리 테이블에 USE 내역 기록
-        pointHistoryTable.insert(
-                userId,
-                amount,
-                TransactionType.USE,
-                System.currentTimeMillis()
-        );
-
-        return updated;
     }
 }
